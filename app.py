@@ -4,10 +4,13 @@ import sklearn
 import streamlit as st
 from sklearn.metrics.pairwise import cosine_similarity
 import os
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Try to load environment variables from .env file (optional)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Page Config
 st.set_page_config(
@@ -40,7 +43,7 @@ def initialize_ai_model():
             model_type = "Gemini"
             return ai_model, model_type
         except Exception as e:
-            st.warning(f"Gemini initialization failed: {e}")
+            pass
     
     # Try OpenAI ChatGPT
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -49,9 +52,9 @@ def initialize_ai_model():
             import openai
             openai.api_key = openai_key
             model_type = "ChatGPT"
-            return None, model_type  # We'll use openai.ChatCompletion directly
+            return None, model_type
         except Exception as e:
-            st.warning(f"ChatGPT initialization failed: {e}")
+            pass
     
     return ai_model, model_type
 
@@ -128,7 +131,7 @@ if vectorizer is not None and faq_df is not None:
     if model_type:
         st.sidebar.success(f"✅ AI Model: {model_type} (Fallback Enabled)")
     else:
-        st.sidebar.warning("⚠️ No AI model configured. Only FAQ matching available.")
+        st.sidebar.info("ℹ️ No AI model configured. Only FAQ matching available.")
 
     # User Input
     st.subheader("❓ Ask Your Question")
