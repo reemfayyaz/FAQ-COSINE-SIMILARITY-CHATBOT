@@ -1,118 +1,533 @@
+import os
 import joblib
 import pandas as pd
-import sklearn
 import streamlit as st
-from sklearn.metrics.pairwise import cosine_similarity
-import os
 
-# Try to load environment variables from .env file (optional)
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# =========================================================
+# PAGE CONFIGURATION
+# =========================================================
+
+st.set_page_config(
+    page_title="AI & Data Science FAQ Assistant",
+    page_icon="🤖",
+    layout="centered",
+    initial_sidebar_state="expanded",
+)
+
+
+# =========================================================
+# FILE SETTINGS
+# =========================================================
+
+VECTORIZER_FILE = "vectorizer.pkl"
+FAQ_FILE = "faq_dataset.pkl"
+
+SIMILARITY_THRESHOLD = 0.25
+
+
+# =========================================================
+# LOAD .ENV FILE
+# =========================================================
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Page Config
-st.set_page_config(
-    page_title="AI & Data Science FAQ Assistant",
-    page_icon="🤖",
-    layout="centered",
+
+# =========================================================
+# GET SECRET / ENVIRONMENT VARIABLE
+# =========================================================
+
+def get_secret(name):
+    """
+    Get API key from Streamlit Secrets first,
+    then fall back to environment variables.
+    """
+
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+
+    return os.getenv(name)
+
+
+# =========================================================
+# CUSTOM CSS
+# =========================================================
+
+st.markdown(
+    """
+    <style>
+
+    .block-container {
+        max-width: 900px;
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+    }
+
+    .main-title {
+        text-align: center;
+        font-size: 2.7rem;
+        font-weight: 800;
+        margin-bottom: 0;
+    }
+
+    .subtitle {
+        text-align: center;
+        opacity: 0.75;
+        margin-bottom: 2rem;
+        font-size: 1.05rem;
+    }
+
+    .answer-card {
+        padding: 1.4rem;
+        border-radius: 16px;
+        border: 1px solid rgba(128,128,128,0.25);
+        margin-top: 1rem;
+    }
+
+    .source-badge {
+        display: inline-block;
+        padding: 5px 12px;
+        border-radius: 20px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        background: rgba(100,100,255,0.12);
+        margin-bottom: 10px;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# Title & Description
-st.title("🤖 AI & Data Science FAQ Assistant")
-st.write(
-    "Ask any question related to Data Science, Machine Learning, Python, SQL, or Course Details!"
-)
 
+# =========================================================
+# LOAD FAQ DATA
+# =========================================================
 
-# Initialize AI Models
-@st.cache_resource
-def initialize_ai_model():
-    """Initialize Google Gemini or ChatGPT based on available API keys"""
-    ai_model = None
-    model_type = None
-    
-    # Try Google Gemini
-    gemini_key = os.getenv("GOOGLE_API_KEY")
-    if gemini_key:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=gemini_key)
-            ai_model = genai.GenerativeModel("gemini-pro")
-            model_type = "Gemini"
-            return ai_model, model_type
-        except Exception as e:
-            pass
-    
-    # Try OpenAI ChatGPT
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if openai_key:
-        try:
-            import openai
-            openai.api_key = openai_key
-            model_type = "ChatGPT"
-            return None, model_type
-        except Exception as e:
-            pass
-    
-    return ai_model, model_type
-
-
-# Load Vectorizer and FAQ Dataset
 @st.cache_resource
 def load_resources():
     try:
-        # Load TF-IDF Vectorizer and DataFrame
-        vectorizer = joblib.load("vectorizer.pkl")
-        faq_df = joblib.load("faq_dataset.pkl")
+        vectorizer = joblib.load(VECTORIZER_FILE)
+        faq_df = joblib.load(FAQ_FILE)
+
+        # Make sure required columns exist
+        if "Question" not in faq_df.columns:
+            raise ValueError(
+                "FAQ dataset must contain a 'Question' column."
+            )
+
+        if "Answer" not in faq_df.columns:
+            raise ValueError(
+                "FAQ dataset must contain an 'Answer' column."
+            )
+
         return vectorizer, faq_df
+
+    except FileNotFoundError as e:
+        st.error(f"Required file not found: {e}")
+        return None, None
+
     except Exception as e:
-        st.error(f"Error loading model or dataset files: {e}")
+        st.error(f"Error loading FAQ resources: {e}")
         return None, None
 
 
-def get_ai_response(question, model_type, ai_model=None):
-    """Get response from AI model (Gemini or ChatGPT)"""
-    try:
-        context = """You are a helpful AI assistant for a Data Science, Machine Learning, and AI course platform. 
-        You specialize in answering questions about Data Science, Machine Learning, Python, SQL, Deep Learning, NLP, 
-        Computer Vision, Power BI, Tableau, RAG, and course-related queries. 
-        Provide clear, concise, and accurate answers. If the question is outside your domain, politely redirect to course topics."""
-        
-        if model_type == "Gemini":
-            response = ai_model.generate_content(f"{context}\n\nQuestion: {question}")
-            return response.text
-        
-        elif model_type == "ChatGPT":
-            import openai
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": context},
-                    {"role": "user", "content": question}
-                ],
-                max_tokens=500,
-                temperature=0.7
-            )
-            return response.choices[0].message.content
-    
-    except Exception as e:
-        return f"Error getting AI response: {str(e)}"
+# =========================================================
+# SAVE NEW QUESTION AND ANSWER
+# =========================================================
 
+def save_new_faq(question, answer, faq_df):
+    """
+    Add a new AI-generated question/answer to FAQ dataset
+    and rebuild the TF-IDF vectorizer.
+    """
+
+    try:
+
+        # Avoid duplicates
+        existing_questions = (
+            faq_df["Question"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+
+        if question.strip().lower() in existing_questions.values:
+            return faq_df, False
+
+        # Create new record
+        new_row = pd.DataFrame(
+            {
+                "Question": [question.strip()],
+                "Answer": [answer.strip()],
+            }
+        )
+
+        # If dataset contains extra columns, add blank values
+        for column in faq_df.columns:
+            if column not in new_row.columns:
+                new_row[column] = ""
+
+        new_row = new_row[faq_df.columns]
+
+        # Add new record
+        updated_df = pd.concat(
+            [faq_df, new_row],
+            ignore_index=True
+        )
+
+        # Create NEW vectorizer
+        new_vectorizer = TfidfVectorizer(
+            stop_words="english",
+            lowercase=True,
+            ngram_range=(1, 2)
+        )
+
+        new_vectorizer.fit(
+            updated_df["Question"].astype(str)
+        )
+
+        # Save updated files
+        joblib.dump(updated_df, FAQ_FILE)
+        joblib.dump(new_vectorizer, VECTORIZER_FILE)
+
+        # Clear Streamlit cache
+        st.cache_resource.clear()
+
+        return updated_df, True
+
+    except Exception as e:
+        st.error(f"Could not save new FAQ: {e}")
+        return faq_df, False
+
+
+# =========================================================
+# INITIALIZE GEMINI
+# =========================================================
+
+@st.cache_resource
+def initialize_gemini():
+
+    api_key = get_secret("GEMINI_API_KEY")
+
+    # Also accept GOOGLE_API_KEY
+    if not api_key:
+        api_key = get_secret("GOOGLE_API_KEY")
+
+    if not api_key:
+        return None
+
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+
+        return client
+
+    except Exception as e:
+        st.sidebar.warning(
+            f"Gemini could not initialize: {e}"
+        )
+        return None
+
+
+# =========================================================
+# INITIALIZE OPENAI
+# =========================================================
+
+@st.cache_resource
+def initialize_openai():
+
+    api_key = get_secret("OPENAI_API_KEY")
+
+    if not api_key:
+        return None
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+
+        return client
+
+    except Exception as e:
+        st.sidebar.warning(
+            f"OpenAI could not initialize: {e}"
+        )
+        return None
+
+
+# =========================================================
+# SYSTEM INSTRUCTIONS
+# =========================================================
+
+SYSTEM_PROMPT = """
+You are an AI assistant for a Data Science and Artificial
+Intelligence learning platform.
+
+You specialize in:
+
+- Data Science
+- Artificial Intelligence
+- Machine Learning
+- Deep Learning
+- Python
+- SQL
+- NLP
+- Computer Vision
+- Power BI
+- Tableau
+- RAG
+- Data Analytics
+- Statistics
+- Generative AI
+- AI tools
+- Programming concepts
+- Course-related questions
+
+Your answers should be:
+
+1. Accurate
+2. Beginner friendly
+3. Clear and concise
+4. Professional
+5. Easy to understand
+
+When useful, provide simple examples.
+
+If the user asks something outside these subjects, you may still
+answer general educational questions, but do not invent information
+about course prices, certificates, schedules, or company policies
+unless that information was supplied to you.
+"""
+
+
+# =========================================================
+# GEMINI RESPONSE
+# =========================================================
+
+def ask_gemini(question, client):
+
+    try:
+        from google.genai import types
+
+        response = client.models.generate_content(
+            model="gemini-3.7-flash",
+            contents=question,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.4,
+                max_output_tokens=700,
+            ),
+        )
+
+        return response.text
+
+    except Exception as e:
+        return None
+
+
+# =========================================================
+# CHATGPT RESPONSE
+# =========================================================
+
+def ask_chatgpt(question, client):
+
+    try:
+
+        response = client.responses.create(
+            model="gpt-5.6",
+            instructions=SYSTEM_PROMPT,
+            input=question,
+        )
+
+        return response.output_text
+
+    except Exception as e:
+        return None
+
+
+# =========================================================
+# GET AI FALLBACK RESPONSE
+# =========================================================
+
+def get_ai_response(question, gemini_client, openai_client):
+
+    # Try Gemini first
+    if gemini_client:
+
+        answer = ask_gemini(
+            question,
+            gemini_client
+        )
+
+        if answer:
+            return answer, "Google Gemini"
+
+    # If Gemini fails, try ChatGPT
+    if openai_client:
+
+        answer = ask_chatgpt(
+            question,
+            openai_client
+        )
+
+        if answer:
+            return answer, "OpenAI ChatGPT"
+
+    return None, None
+
+
+# =========================================================
+# SEARCH FAQ DATABASE
+# =========================================================
+
+def search_faq(question, vectorizer, faq_df):
+
+    try:
+
+        dataset_vectors = vectorizer.transform(
+            faq_df["Question"].astype(str)
+        )
+
+        query_vector = vectorizer.transform(
+            [question]
+        )
+
+        similarities = cosine_similarity(
+            query_vector,
+            dataset_vectors
+        ).flatten()
+
+        best_index = similarities.argmax()
+
+        confidence = float(
+            similarities[best_index]
+        )
+
+        return best_index, confidence
+
+    except Exception as e:
+        st.error(f"FAQ search error: {e}")
+        return None, 0
+
+
+# =========================================================
+# LOAD EVERYTHING
+# =========================================================
 
 vectorizer, faq_df = load_resources()
-ai_model, model_type = initialize_ai_model()
 
-if vectorizer is not None and faq_df is not None:
-    # Sidebar Info
-    st.sidebar.header("📊 Dataset Overview")
-    st.sidebar.write(f"Total FAQs Loaded: **{len(faq_df)}**")
+gemini_client = initialize_gemini()
+openai_client = initialize_openai()
 
-    st.sidebar.subheader("Available Topics")
+
+# =========================================================
+# HEADER
+# =========================================================
+
+st.markdown(
+    """
+    <div class="main-title">
+        🤖 AI & Data Science Assistant
+    </div>
+
+    <div class="subtitle">
+        Intelligent FAQ Search + Gemini + ChatGPT
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.write(
+    """
+    Ask questions about **Data Science, AI, Machine Learning,
+    Python, SQL, Power BI, Deep Learning, NLP, RAG, courses,
+    and more.**
+    """
+)
+
+
+# =========================================================
+# CHECK FILES
+# =========================================================
+
+if vectorizer is None or faq_df is None:
+
+    st.error(
+        """
+        The application could not load the FAQ files.
+
+        Make sure these files are in the same folder as app.py:
+
+        • vectorizer.pkl
+        • faq_dataset.pkl
+        """
+    )
+
+    st.stop()
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+with st.sidebar:
+
+    st.title("🤖 AI Assistant")
+
+    st.markdown("---")
+
+    st.subheader("📚 Knowledge Base")
+
+    st.metric(
+        "Total FAQs",
+        len(faq_df)
+    )
+
+    st.markdown("---")
+
+    st.subheader("🧠 AI Models")
+
+    if gemini_client:
+        st.success("✅ Google Gemini")
+
+    else:
+        st.caption("⚪ Gemini not configured")
+
+    if openai_client:
+        st.success("✅ ChatGPT")
+
+    else:
+        st.caption("⚪ ChatGPT not configured")
+
+    if not gemini_client and not openai_client:
+
+        st.warning(
+            """
+            Add GEMINI_API_KEY or
+            OPENAI_API_KEY to enable
+            AI fallback.
+            """
+        )
+
+    st.markdown("---")
+
+    st.subheader("📖 Topics")
+
     topics = [
-        "Machine Learning",
         "Artificial Intelligence",
+        "Machine Learning",
         "Data Science",
         "Python",
         "SQL",
@@ -122,61 +537,232 @@ if vectorizer is not None and faq_df is not None:
         "Power BI",
         "Tableau",
         "RAG",
-        "Course & Fee Details",
+        "Generative AI",
     ]
+
     for topic in topics:
-        st.sidebar.write(f"- {topic}")
+        st.caption(f"• {topic}")
 
-    # Display AI Model Status
-    if model_type:
-        st.sidebar.success(f"✅ AI Model: {model_type} (Fallback Enabled)")
-    else:
-        st.sidebar.info("ℹ️ No AI model configured. Only FAQ matching available.")
 
-    # User Input
-    st.subheader("❓ Ask Your Question")
-    user_query = st.text_input(
-        "Type your question here:",
-        placeholder="e.g., What is Data Science? or Do you provide certificates?",
+# =========================================================
+# CHAT HISTORY
+# =========================================================
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+
+# Display previous messages
+for message in st.session_state.messages:
+
+    with st.chat_message(message["role"]):
+
+        st.markdown(message["content"])
+
+        if message.get("source"):
+            st.caption(
+                f"Source: {message['source']}"
+            )
+
+
+# =========================================================
+# CHAT INPUT
+# =========================================================
+
+user_query = st.chat_input(
+    "Ask me anything about AI or Data Science..."
+)
+
+
+# =========================================================
+# PROCESS QUESTION
+# =========================================================
+
+if user_query:
+
+    # Save user message
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": user_query,
+        }
     )
 
-    if st.button("Search Answer", type="primary"):
-        if user_query.strip():
-            # Vectorize questions dataset & user query
-            dataset_vectors = vectorizer.transform(faq_df["Question"])
-            query_vector = vectorizer.transform([user_query])
+    with st.chat_message("user"):
+        st.markdown(user_query)
 
-            # Calculate similarity
-            similarities = cosine_similarity(
-                query_vector, dataset_vectors
-            ).flatten()
-            best_idx = similarities.argmax()
-            confidence = similarities[best_idx]
 
-            # Threshold check
-            if confidence > 0.2:
-                st.success("### Answer Found!")
-                st.write(f"**Matched Question:** {faq_df.iloc[best_idx]['Question']}")
-                st.info(f"**Answer:** {faq_df.iloc[best_idx]['Answer']}")
-                st.caption(f"Match Confidence Score: {confidence:.2%}")
-            else:
-                # Fallback to AI Model if available
-                if model_type:
-                    st.info("📌 No close match in FAQ database. Using AI Assistant to answer...")
-                    with st.spinner(f"Getting response from {model_type}..."):
-                        ai_response = get_ai_response(user_query, model_type, ai_model)
-                    st.success("### AI Assistant Response")
-                    st.info(f"**Answer:** {ai_response}")
-                    st.caption(f"Source: {model_type} AI Model")
-                else:
-                    st.warning(
-                        "Sorry, I couldn't find a close answer to your question. Try rephrasing or asking about our courses, fees, or AI topics!"
+    # -----------------------------------------------------
+    # SEARCH EXISTING FAQ
+    # -----------------------------------------------------
+
+    best_index, confidence = search_faq(
+        user_query,
+        vectorizer,
+        faq_df
+    )
+
+
+    # -----------------------------------------------------
+    # FAQ MATCH FOUND
+    # -----------------------------------------------------
+
+    if (
+        best_index is not None
+        and confidence >= SIMILARITY_THRESHOLD
+    ):
+
+        answer = str(
+            faq_df.iloc[best_index]["Answer"]
+        )
+
+        matched_question = str(
+            faq_df.iloc[best_index]["Question"]
+        )
+
+        source = "FAQ Knowledge Base"
+
+        with st.chat_message("assistant"):
+
+            st.markdown(answer)
+
+            st.caption(
+                f"📚 FAQ Match • "
+                f"Confidence: {confidence:.1%}"
+            )
+
+            with st.expander(
+                "View matched question"
+            ):
+                st.write(matched_question)
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "source": source,
+            }
+        )
+
+
+    # -----------------------------------------------------
+    # NO FAQ MATCH - ASK AI
+    # -----------------------------------------------------
+
+    else:
+
+        if gemini_client or openai_client:
+
+            with st.chat_message("assistant"):
+
+                with st.spinner(
+                    "AI is thinking..."
+                ):
+
+                    ai_answer, source = get_ai_response(
+                        user_query,
+                        gemini_client,
+                        openai_client,
                     )
+
+                if ai_answer:
+
+                    st.markdown(ai_answer)
+
+                    st.caption(
+                        f"✨ Generated by {source}"
+                    )
+
+                    # -------------------------------------
+                    # SAVE NEW QUESTION AUTOMATICALLY
+                    # -------------------------------------
+
+                    updated_df, saved = save_new_faq(
+                        user_query,
+                        ai_answer,
+                        faq_df,
+                    )
+
+                    if saved:
+
+                        st.success(
+                            "📚 New question added to "
+                            "the FAQ knowledge base."
+                        )
+
+                        faq_df = updated_df
+
+                    # Save to chat history
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": ai_answer,
+                            "source": source,
+                        }
+                    )
+
+                else:
+
+                    error_message = (
+                        "I couldn't generate an AI response. "
+                        "Please check your API key."
+                    )
+
+                    st.error(error_message)
+
         else:
-            st.error("Please enter a question first.")
 
-    st.markdown("---")
+            with st.chat_message("assistant"):
 
-    # Display full dataset table
-    with st.expander("👀 View All Available Questions & Answers"):
-        st.dataframe(faq_df, use_container_width=True)
+                st.warning(
+                    """
+                    I couldn't find this question in the FAQ
+                    database and no AI API is configured.
+
+                    Add a Gemini or OpenAI API key to enable
+                    intelligent fallback answers.
+                    """
+                )
+
+
+# =========================================================
+# DATASET VIEWER
+# =========================================================
+
+st.markdown("---")
+
+with st.expander(
+    "📚 View FAQ Knowledge Base"
+):
+
+    st.dataframe(
+        faq_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# =========================================================
+# CLEAR CHAT
+# =========================================================
+
+if st.sidebar.button(
+    "🗑️ Clear Chat",
+    use_container_width=True
+):
+
+    st.session_state.messages = []
+
+    st.rerun()
+
+
+# =========================================================
+# FOOTER
+# =========================================================
+
+st.markdown("---")
+
+st.caption(
+    "🤖 AI & Data Science FAQ Assistant • "
+    "TF-IDF + Gemini + ChatGPT"
+)
